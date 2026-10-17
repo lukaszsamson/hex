@@ -49,7 +49,7 @@ defmodule Hex.Repo do
     end
   end
 
-  defp default_organization(repo, source, name) do
+  defp default_organization(repo, {source, repository_urls}, name) do
     public_key = merge_values(Map.get(repo, :public_key), source.public_key)
     auth_key = merge_values(Map.get(repo, :auth_key), source.auth_key)
 
@@ -63,7 +63,7 @@ defmodule Hex.Repo do
       )
 
     repo
-    |> put_organization_url(source, name)
+    |> put_organization_url(source, repository_urls, name)
     |> Map.put(:public_key, public_key)
     |> Map.put(:auth_key, auth_key)
     |> Map.put(:oauth_exchange, oauth_exchange)
@@ -72,11 +72,14 @@ defmodule Hex.Repo do
   end
 
   # build_url appends "/repos/<org>" via :repo_organization. Normalize a missing
-  # or baked-in "/repos/<org>" URL to that form; keep a custom URL as-is.
-  defp put_organization_url(repo, source, name) do
+  # URL, or a repository's URL with or without "/repos/<org>", to that form. A
+  # repository's own URL isn't an organization's custom URL, it's the
+  # repository itself. Keep any other URL as a custom URL.
+  defp put_organization_url(repo, source, repository_urls, name) do
     url = Map.get(repo, :url)
+    derived_urls = Enum.flat_map(repository_urls, &[&1, &1 <> "/repos/#{name}"])
 
-    if url in [nil, source.url <> "/repos/#{name}"] do
+    if url == nil or url in derived_urls do
       repo
       |> Map.put(:url, source.url)
       |> Map.put(:repo_organization, name)
@@ -111,8 +114,8 @@ defmodule Hex.Repo do
 
   defp fetch_organization_fallback(repo) do
     case String.split(repo, ":", parts: 2) do
-      [source, organization] ->
-        source = get_repo(source)
+      [source_name, organization] ->
+        source = organization_source(source_name, Hex.State.fetch!(:repos), nil)
         {:ok, default_organization(%{}, source, organization)}
 
       _ ->
@@ -134,25 +137,18 @@ defmodule Hex.Repo do
     )
   end
 
-  def merge_hexpm(repos, hexpm \\ hexpm_repo()) do
+  def merge_hexpm(repos, hexpm) do
     Map.update(repos, "hexpm", hexpm, &Map.merge(hexpm, &1))
   end
 
-  def update_organizations(repos) do
+  # Hex.State.init passes the trusted mirror URL, since it loads the repos in
+  # the Hex.State process. Everywhere else it's read from Hex.State.
+  def update_organizations(repos, trusted_mirror_url \\ nil) do
     Map.new(repos, fn {name, repo} ->
       case split_repo_name(name) do
-        [source, organization] ->
-          state_pid = Process.whereis(Hex.State)
-
-          source =
-            if state_pid && state_pid != self() do
-              get_repo(source)
-            else
-              Map.fetch!(repos, source)
-            end
-
-          repo = default_organization(repo, source, organization)
-          {name, repo}
+        [source_name, organization] ->
+          source = organization_source(source_name, repos, trusted_mirror_url)
+          {name, default_organization(repo, source, organization)}
 
         _ ->
           {name, Map.put(repo, :trusted, true)}
@@ -163,8 +159,8 @@ defmodule Hex.Repo do
   def clean_organizations(repos) do
     Map.new(repos, fn {name, repo} ->
       case split_repo_name(name) do
-        [source, organization] ->
-          source = get_repo(source)
+        [source_name, organization] ->
+          source = organization_source(source_name, repos, nil)
           default = default_organization(%{}, source, organization)
           {name, clean_repo(repo, default)}
 
@@ -172,6 +168,36 @@ defmodule Hex.Repo do
           {name, Map.delete(repo, :trusted)}
       end
     end)
+  end
+
+  # Returns the repository an organization's repository takes its config from,
+  # and the repository URLs its URL is derived from. In the Hex.State process,
+  # while Hex.State.init loads the repos, and without Hex.State, only the given
+  # repos and trusted mirror URL are available.
+  defp organization_source(source_name, repos, trusted_mirror_url) do
+    state_pid = Process.whereis(Hex.State)
+
+    if state_pid && state_pid != self() do
+      hexpm = Map.get(repos, "hexpm") || Map.fetch!(Hex.State.fetch!(:repos), "hexpm")
+      trusted_mirror_url = Hex.State.fetch!(:trusted_mirror_url)
+      organization_source(source_name, get_repo(source_name), hexpm, trusted_mirror_url)
+    else
+      source = Map.fetch!(repos, source_name)
+      organization_source(source_name, source, Map.get(repos, "hexpm"), trusted_mirror_url)
+    end
+  end
+
+  # A Hex.pm organization's repository goes through a mirror only when it's set
+  # with HEX_TRUSTED_MIRROR. A mirror set with HEX_MIRROR doesn't get
+  # credentials, so it can't serve the repository, and it's fetched from the
+  # hexpm repository's own URL instead.
+  defp organization_source("hexpm", source, hexpm, trusted_mirror_url) do
+    url = trusted_mirror_url || hexpm.url
+    {%{source | url: url, trusted: true}, Enum.uniq([url, hexpm.url])}
+  end
+
+  defp organization_source(_source_name, source, _hexpm, _trusted_mirror_url) do
+    {source, [source.url]}
   end
 
   def clean_hexpm(repos) do
@@ -346,89 +372,23 @@ defmodule Hex.Repo do
         oauth_exchange: Map.get(repo_config, :oauth_exchange, false)
     }
 
-    if repo_config.auth_key do
-      maybe_warn_deprecated_repo_key(repo_name, organization, repo_config)
-    end
-
     config =
       case Map.fetch(repo_config, :oauth_exchange_url) do
         {:ok, oauth_exchange_url} -> Map.put(config, :oauth_exchange_url, oauth_exchange_url)
         :error -> Map.put(config, :oauth_exchange_url, config.api_url)
       end
 
+    config =
+      if repo_name == "hexpm" and is_binary(organization) do
+        Hex.Auth.put_organization_auth(config, organization, repo_config)
+      else
+        config
+      end
+
     if etag do
       %{config | http_etag: etag}
     else
       config
-    end
-  end
-
-  # Only organization repositories are deprecated here. HEX_REPOS_KEY still
-  # authenticates the base hexpm repo and trusted mirrors (organization is nil
-  # for those), so they must not be warned about.
-  defp maybe_warn_deprecated_repo_key("hexpm", organization, repo_config)
-       when is_binary(organization) do
-    case deprecated_repo_key_source(repo_config) do
-      :env ->
-        if Hex.Server.should_warn?({:deprecated_repos_key, organization}) do
-          Hex.Shell.warn("""
-          Authenticating to the #{organization} repository with HEX_REPOS_KEY is deprecated \
-          and will stop working in Hex 2.6.
-
-          For development authenticate as a user with `mix hex.user auth`. For CI \
-          authenticate per organization with `mix hex.organization auth #{organization} --key KEY`.
-          """)
-        end
-
-      :config ->
-        warn_deprecated_stored_key(organization, Map.get(repo_config, :auth_key_owner))
-    end
-  end
-
-  defp maybe_warn_deprecated_repo_key(_repo_name, _organization, _repo_config), do: :ok
-
-  defp warn_deprecated_stored_key(_organization, :organization), do: :ok
-
-  defp warn_deprecated_stored_key(organization, :user) do
-    if Hex.Server.should_warn?({:deprecated_repo_key, organization}) do
-      Hex.Shell.warn("""
-      Authenticating to the #{organization} repository with a key owned by your user \
-      account is deprecated and will stop working in Hex 2.6.
-
-      For development authenticate as a user with `mix hex.user auth`. For CI generate an \
-      organization key with `mix hex.organization key #{organization} generate` and pass it \
-      with `mix hex.organization auth #{organization} --key KEY`.
-      """)
-    end
-  end
-
-  defp warn_deprecated_stored_key(organization, _owner) do
-    if Hex.Server.should_warn?({:deprecated_repo_key, organization}) do
-      Hex.Shell.warn("""
-      Authenticating to the #{organization} repository with a stored key is deprecated \
-      and will stop working in Hex 2.6.
-
-      For development authenticate as a user with `mix hex.user auth`. For CI generate an \
-      organization key with `mix hex.organization key #{organization} generate` and pass it \
-      with `mix hex.organization auth #{organization} --key KEY`.
-
-      If you already authenticate with an organization key, re-run \
-      `mix hex.organization auth #{organization} --key KEY` on this Hex version to record it \
-      and silence this warning.
-      """)
-    end
-  end
-
-  # HEX_REPOS_KEY is exposed as the hexpm source `auth_key` and inherited by
-  # `hexpm:*` repos, so an `auth_key` equal to `repos_key` came from the
-  # environment, while any other value was stored in the local config.
-  defp deprecated_repo_key_source(repo_config) do
-    repos_key = Hex.State.fetch!(:repos_key)
-
-    if repos_key != nil and repo_config.auth_key == repos_key do
-      :env
-    else
-      :config
     end
   end
 end

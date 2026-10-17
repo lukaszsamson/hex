@@ -198,12 +198,12 @@ defmodule Hex.Config do
     end
   end
 
-  def read_repos(config) do
+  def read_repos(config, trusted_mirror_url \\ nil) do
     hexpm = Hex.Repo.default_hexpm_repo()
 
     (config[:"$repos"] || %{})
     |> Hex.Repo.merge_hexpm(hexpm)
-    |> Hex.Repo.update_organizations()
+    |> Hex.Repo.update_organizations(trusted_mirror_url)
   end
 
   def update_repos(repos) do
@@ -253,7 +253,7 @@ defmodule Hex.Config do
   defp put_state_repos(repos) do
     state_repos =
       repos
-      |> Hex.Repo.merge_hexpm()
+      |> Hex.Repo.merge_hexpm(Hex.Repo.default_hexpm_repo())
       |> Hex.Repo.update_organizations()
 
     Hex.State.put(:repos, state_repos)

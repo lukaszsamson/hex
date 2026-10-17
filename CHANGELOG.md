@@ -4,6 +4,11 @@
 
 ### Backwards incompatible changes
 
+* Require `--key` in `mix hex.organization auth ORGANIZATION`. For development authenticate with `mix hex.user auth`, which gives access to all your organizations. For CI generate an organization key with `mix hex.organization key ORGANIZATION generate` and pass it with `--key`
+* Exchange the key given to `mix hex.organization auth ORGANIZATION --key KEY` for a short-lived token and store only the token. Hex uses the token for about 25 minutes and doesn't refresh it, so in CI run the command right before fetching dependencies
+* Stop authenticating to organization repositories with keys that earlier Hex versions stored in `~/.hex/hex.config`. Authenticate again with `mix hex.user auth` or `mix hex.organization auth ORGANIZATION --key KEY`
+* Stop authenticating to organization repositories with `HEX_REPOS_KEY`. Use `mix hex.organization auth ORGANIZATION --key KEY` instead. `HEX_REPOS_KEY` still authenticates to the hexpm repository and to mirrors set with `HEX_TRUSTED_MIRROR`
+* Fetch packages from organization repositories on hex.pm from repo.hex.pm when a mirror is set with `HEX_MIRROR`, and through the mirror when it's set with `HEX_TRUSTED_MIRROR`. Before, where they were fetched from depended on whether the organization was in `~/.hex/hex.config` when the command started
 * Require OTP 24 or later. Hex 2.4.2 to 2.5.1 can't unpack packages on OTP 22, so Hex 2.4.1 is the last release that works there. Hex 2.5.1 is the last release for OTP 23
 
 ### Enhancements
@@ -12,7 +17,6 @@
 * Print warnings to standard error instead of standard output, keeping stdout clean for machine-readable output such as `mix hex.outdated --json`. Warning-colored lines that are part of a command's regular output, such as retirement notices in `mix hex.info` and the `mix deps.get` dependency listing, remain on standard output
 * Add `--format sarif` and `--output PATH` options to `mix hex.audit` to render the audit result as a SARIF v2.1.0 document that can be uploaded to GitHub code scanning and other SARIF consumers. Findings are anchored to the dependency's `mix.lock` entry and ignored findings are included as suppressed results. Requires OTP 27 or later
 * Link to the hex.pm diffs page (`https://hex.pm/diffs`) in `mix hex.outdated` now that package diffs have moved from diff.hex.pm into hex.pm
-* Record whether the key given to `mix hex.organization auth ORGANIZATION --key KEY` is owned by the organization or by a user. Organization keys no longer trigger the stored-key deprecation warning, while user keys warn that they will stop working in Hex 2.6. Re-run the command on this Hex version to record the owner of an already stored organization key and silence the warning
 * Stop listing unchanged dependencies after `mix deps.get` and `mix deps.update` resolve dependencies. Unchanged dependencies that are retired or have security advisories are still listed under "Unchanged:"
 
 * Add the `policy_enforce_lock` config. When it's enabled and a policy is active, `mix deps.get` and `mix deps.update` fail if a Hex package in `mix.lock` is rejected by the policy, using the same check as `mix hex.audit --policy`. Findings acknowledged with `ignore_advisories` or `ignore_retirements` pass, and a package matched by a DENY override fails until the policy changes. Configure it in the `mix.exs` `:hex` block, with the `HEX_POLICY_ENFORCE_LOCK` environment variable, or with `mix hex.config`
@@ -33,6 +37,10 @@
 * Skip HTTPS certificate verification when the `unsafe_https` config or the `HEX_UNSAFE_HTTPS` environment variable is set. Since Hex 2.3.0 the setting had no effect and certificates were always verified
 * Print the package version in the error raised when resolved Hex packages give the same dependency different OTP application names. Since Hex 0.21.3 the error showed a literal `{version}` instead
 * Resolve dependencies after compiling in the same command, such as `mix do compile + deps.get`, on Elixir 1.15 and later. Since Hex 2.4.1 this raised `UndefinedFunctionError` for `Hex.Stdlib.ensure_application!/1`
+
+### Deprecations
+
+* Warn when the key given to `mix hex.organization auth ORGANIZATION --key KEY` is owned by a user account instead of the organization. hex.pm stops accepting user keys with repository permissions on 16 January 2027, whatever Hex version you run. Use `mix hex.user auth` for development and an organization key from `mix hex.organization key ORGANIZATION generate` for CI
 
 ## v2.5.3 (2026-10-14)
 

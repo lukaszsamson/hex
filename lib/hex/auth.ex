@@ -50,6 +50,89 @@ defmodule Hex.Auth do
   end
 
   @doc """
+  Authenticate requests to a Hex.pm organization's repository with the token
+  that `mix hex.organization auth --key` stored for it. Without an unexpired
+  token hex_cli_auth uses the user's session or Workload Identity.
+
+  hex_cli_auth would otherwise use a key stored for the organization, or the
+  hexpm repository's key from HEX_REPOS_KEY, before the user's session. A key
+  stored by an earlier Hex version and HEX_REPOS_KEY don't authenticate
+  organization repositories, so neither is handed to it.
+  """
+  def put_organization_auth(config, organization, repo_config) do
+    auth_config = organization_auth_config(config, organization, repo_config)
+    put_in(config.cli_auth_callbacks.get_auth_config, fn _repo -> auth_config end)
+  end
+
+  @doc """
+  The token `mix hex.organization auth --key` stored for an organization's
+  repository, while it hasn't expired.
+  """
+  def organization_token(%{oauth_token: %{access_token: access_token, expires_at: expires_at}}) do
+    if :mix_hex_cli_auth.is_token_expired(expires_at), do: :error, else: {:ok, access_token}
+  end
+
+  def organization_token(_repo_config), do: :error
+
+  # A repo_key from get_auth_config is used without checking whether the
+  # repository is trusted, so only a trusted repository gets the token.
+  defp organization_auth_config(%{trusted: true}, organization, repo_config) do
+    case organization_token(repo_config) do
+      {:ok, access_token} ->
+        %{repo_key: "Bearer #{access_token}"}
+
+      :error ->
+        maybe_warn_organization_auth(organization, repo_config)
+        :undefined
+    end
+  end
+
+  defp organization_auth_config(_config, _organization, _repo_config), do: :undefined
+
+  # Warns when the repository has a credential Hex doesn't use, or an expired
+  # token, and nothing else will authenticate the request.
+  defp maybe_warn_organization_auth(organization, repo_config) do
+    reason = organization_auth_reason(organization, repo_config)
+
+    if reason && not Hex.OAuth.has_tokens?() && not Hex.WorkloadIdentity.available?() &&
+         Hex.Server.should_warn?({:organization_auth, organization}) do
+      Hex.Shell.warn("""
+      #{reason}
+
+      For development authenticate as a user with `mix hex.user auth`. For CI \
+      authenticate with an organization key right before fetching dependencies:
+
+          mix hex.organization auth #{organization} --key KEY
+      """)
+    end
+  end
+
+  # Organization repositories inherit the hexpm repository's auth_key, which is
+  # HEX_REPOS_KEY or a key set with `mix hex.repo set hexpm --auth-key`. Any
+  # other auth_key was stored by an earlier Hex version.
+  defp organization_auth_reason(organization, repo_config) do
+    auth_key = Map.get(repo_config, :auth_key)
+
+    cond do
+      auth_key != nil and auth_key == Hex.State.fetch!(:repos_key) ->
+        "Hex doesn't use HEX_REPOS_KEY for organization repositories."
+
+      auth_key != nil and auth_key == Hex.Repo.get_repo("hexpm").auth_key ->
+        "Hex doesn't use the hexpm repository's key for organization repositories."
+
+      auth_key != nil ->
+        "Hex doesn't use the key stored for the #{organization} repository. " <>
+          "Remove it with `mix hex.organization deauth #{organization}`."
+
+      Map.has_key?(repo_config, :oauth_token) ->
+        "The token for the #{organization} repository has expired."
+
+      true ->
+        nil
+    end
+  end
+
+  @doc """
   Execute a function with preemptive authentication using the provided auth data.
   """
   def with_preemptive_auth(auth, config, fun, opts \\ []) do

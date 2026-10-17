@@ -178,6 +178,40 @@ defmodule Hex.WorkloadIdentityTest do
         refute_received {:exchange, _}
       end)
     end
+
+    test "a token from mix hex.organization auth --key takes precedence", %{bypass: bypass} do
+      stub_repository(bypass)
+      put_organization_token(3600)
+
+      assert {:ok, {200, _, "tarball"}} = Hex.Repo.get_tarball("hexpm:acme", "foo", "1.0.0")
+
+      assert_received {:repository, "tarballs/foo-1.0.0.tar", ["Bearer org_token"]}
+      refute_received {:exchange, _}
+    end
+
+    @tag :requires_json
+    test "an expired token from mix hex.organization auth --key is replaced", %{bypass: bypass} do
+      Hex.Server.reset()
+      stub_repository(bypass)
+      put_organization_token(-100)
+
+      assert {:ok, {200, _, "tarball"}} = Hex.Repo.get_tarball("hexpm:acme", "foo", "1.0.0")
+
+      assert_received {:exchange, %{"scope" => "repository:acme"}}
+      assert_received {:repository, "tarballs/foo-1.0.0.tar", ["Bearer minted_token"]}
+      refute Case.shell_output() =~ "has expired"
+    end
+  end
+
+  defp put_organization_token(expires_in) do
+    token = %{access_token: "org_token", expires_at: System.os_time(:second) + expires_in}
+
+    repos =
+      Hex.State.fetch!(:repos)
+      |> Map.put("hexpm:acme", %{oauth_token: token})
+      |> Hex.Repo.update_organizations()
+
+    Hex.State.put(:repos, repos)
   end
 
   defp fetch_tarballs do
